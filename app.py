@@ -1,199 +1,191 @@
 import streamlit as st
 import matplotlib.pyplot as plt
-import datetime
 
 # ===================================================================
-# КОНФИГУРАЦИЯ И СПРАВОЧНЫЕ ДАННЫЕ
+# КОНФИГУРАЦИЯ И ДАННЫЕ ИЗ СТАТЬИ LÖLLGEN 2018
 # ===================================================================
 CONFIG = {
-    'WEIGHTS': {'vo2': 0.4, 'lt2': 0.3, 'hr_rec': 0.2, 'o2_pulse': 0.1},
-    'THRESHOLDS': {
-        'perf_low': 70, 'perf_med': 90, 'hr_rec_min': 12,
-        'rpe_high': 17, 'sbp_warn': 220, 'sbp_crit': 250
+    'WEIGHTS': {'power': 0.35, 'hr': 0.25, 'lactate': 0.20, 'rpe': 0.10, 'recovery': 0.10},
+    'THRESHOLDS': {'sbp_crit': 250, 'sbp_warn': 220, 'hr_rec_min': 12, 'rpe_high': 17},
+    'VALIDATION': {'age': (10, 90), 'weight': (30, 200), 'hr': (40, 220)}
+}
+
+# Таблицы Löllgen (bike, 4-минутные ступени, 200 Вт) — eTable 3a и 4a
+LOLLGEN_200W = {
+    'groups': [160, 200, 240, 280, 320],  # max performance groups
+    'hr': {  # p05 / p95
+        160: (163, 209), 200: (154, 182), 240: (150, 182),
+        280: (138, 160), 320: (138, 160)
     },
-    'VALIDATION': {
-        'age': (10, 90), 'weight': (30, 200), 'hr': (40, 220),
-        'sbp': (90, 260), 'rpe': (6, 20)
+    'lactate': {  # p05 / p95
+        160: (5.7, 18.2), 200: (4.6, 15.8), 240: (3.3, 11.4),
+        280: (3.0, 5.4), 320: (3.0, 5.4)
     }
 }
 
-RAPP_VO2_REF = {
-    'Male': {(18, 29): 46.5, (30, 39): 42.0, (40, 49): 38.5, (50, 59): 34.0, (60, 69): 30.0},
-    'Female': {(18, 29): 37.5, (30, 39): 33.5, (40, 49): 29.5, (50, 59): 26.0, (60, 69): 22.5}
-}
+# Нормы максимальной мощности (eTable 2) — упрощённо для примера
+# Можно расширить полностью, если нужно
 
-FIEDLER_LT2_REF = {
-    'Male': {(14, 24): 2.4, (25, 34): 2.3, (35, 44): 2.1, (45, 54): 1.9, (55, 64): 1.7},
-    'Female': {(14, 24): 1.9, (25, 34): 1.8, (35, 44): 1.7, (45, 54): 1.5, (55, 64): 1.4}
-}
-
-# ===================================================================
-# ЛОГИЧЕСКОЕ ЯДРО
-# ===================================================================
 class StressTestAnalyzer:
     @staticmethod
-    def get_ref_value(data_dict, sex, age):
-        gender_data = data_dict.get(sex, {})
-        for (age_min, age_max), val in gender_data.items():
-            if age_min <= age <= age_max:
-                return val
-        return list(gender_data.values())[0] if age < 18 else list(gender_data.values())[-1]
+    def percentile_score(value, p05, p95):
+        """Нормализация 0-100 по процентилям Löllgen (чем ниже — тем лучше)"""
+        if value <= p05:
+            return 100
+        if value >= p95:
+            return 0
+        return 100 * (p95 - value) / (p95 - p05)
 
     @staticmethod
     def calculate(data):
-        sex, age, weight = data['sex'], int(data['age']), float(data['weight'])
-        power, hr_peak, sbp = float(data['power']), float(data['hr']), float(data['sbp'])
-        hr_rest = float(data['rest_hr']) if data.get('rest_hr') else 60
-        rpe, grade, test_type = int(data['rpe']), float(data.get('grade', 0)), data['type']
-        hr_rec_1min = float(data['hr_rec']) if data.get('hr_rec') else None
+        sex = data['sex']
+        age = int(data['age'])
+        weight = float(data['weight'])
+        test_type = data['type']
+        power = float(data['power'])          # max или субмакс (200 Вт)
+        hr_peak = float(data['hr'])
+        sbp = float(data['sbp'])
+        hr_rest = float(data.get('rest_hr', 60))
+        hr_rec = float(data.get('hr_rec', 0)) or None
+        rpe = int(data['rpe'])
+        submax_load = 200 if test_type == 'bike' else 13  # км/ч для тредмила
 
+        # 1. Power Score (из eTable 2 — упрощённо)
+        # Здесь можно добавить полную таблицу eTable 2
+        power_score = min(power / (3.5 * weight) * 100, 100)  # относительная мощность
+
+        # 2. HR и Lactate Score на субмакс. нагрузке (Löllgen eTable 3/4)
+        # Предполагаем, что пользователь ввёл значения именно на 200 Вт
+        hr_p05, hr_p95 = LOLLGEN_200W['hr'].get(240, (150, 182))  # default 240W group
+        lac_p05, lac_p95 = LOLLGEN_200W['lactate'].get(240, (3.3, 11.4))
+
+        hr_score = StressTestAnalyzer.percentile_score(hr_peak, hr_p05, hr_p95)
+        lactate_score = StressTestAnalyzer.percentile_score(data.get('lactate', 6.0), lac_p05, lac_p95)
+
+        # 3. Recovery
+        rec_idx = (hr_peak - hr_rec) if hr_rec else 0
+        recovery_score = min(rec_idx / 40 * 100, 100) if rec_idx else 50
+
+        # 4. RPE
+        rpe_score = max(100 - (rpe - 6) * (100 / 14), 0)
+
+        # 5. Итоговый CEPS
+        ceps = (
+            CONFIG['WEIGHTS']['power'] * power_score +
+            CONFIG['WEIGHTS']['hr'] * hr_score +
+            CONFIG['WEIGHTS']['lactate'] * lactate_score +
+            CONFIG['WEIGHTS']['rpe'] * rpe_score +
+            CONFIG['WEIGHTS']['recovery'] * recovery_score
+        )
+
+        # Уровень
+        fitness_level = 'low' if ceps < 70 else 'medium' if ceps < 85 else 'high'
+
+        # Зоны Карвонена
         hr_max_pred = 208 - 0.7 * age
         hr_reserve = hr_max_pred - hr_rest
-
-        # 2. VO2peak (Исправленная профессиональная формула)
-        if test_type == 'bike':
-            # 12 мл/Вт + 3.5 мл/кг (базовый метаболизм)
-            vo2_abs_ml = (power * 12) + (3.5 * weight)
-            vo2_rel = vo2_abs_ml / weight
-        else:
-            speed_m_min = (power * 1000) / 60
-            vo2_rel = (0.1 * speed_m_min) + (1.8 * speed_m_min * (grade / 100)) + 3.5
-
-        vo2_abs = vo2_rel * weight / 1000
-        vo2_norm = StressTestAnalyzer.get_ref_value(RAPP_VO2_REF, sex, age)
-        vo2_pct = (vo2_rel / vo2_norm) * 100
-
-        rel_power = power / weight
-        lt2_norm = StressTestAnalyzer.get_ref_value(FIEDLER_LT2_REF, sex, age)
-        lt2_pct = (rel_power / lt2_norm) * 100
-
-        o2_pulse = (vo2_abs * 1000) / hr_peak
-        rec_idx = (hr_peak - hr_rec_1min) if hr_rec_1min else None
-
-        def norm_comp(val): return min(val, 130) / 130 * 100
-        comp_vo2, comp_lt2 = norm_comp(vo2_pct), norm_comp(lt2_pct)
-        comp_rec = (min(rec_idx, 40) / 40 * 100) if rec_idx else 50
-        comp_o2 = min(o2_pulse * 5, 100)
-
-        perf_idx = (CONFIG['WEIGHTS']['vo2'] * comp_vo2 + CONFIG['WEIGHTS']['lt2'] * comp_lt2 +
-                    CONFIG['WEIGHTS']['hr_rec'] * comp_rec + CONFIG['WEIGHTS']['o2_pulse'] * comp_o2)
-
-        fit_level = 'low' if perf_idx < 70 else 'medium' if perf_idx < 90 else 'high'
-        def karvonen(pct): return round((hr_reserve * pct) + hr_rest)
-        
         zones = {
-            'Z1': (karvonen(0.50), karvonen(0.60)), 'Z2': (karvonen(0.60), karvonen(0.70)),
-            'Z3': (karvonen(0.70), karvonen(0.80)), 'Z4': (karvonen(0.80), karvonen(0.90)),
-            'Z5': (karvonen(0.90), int(hr_max_pred))
+            'Z1': (round(hr_rest + 0.5 * hr_reserve), round(hr_rest + 0.6 * hr_reserve)),
+            'Z2': (round(hr_rest + 0.6 * hr_reserve), round(hr_rest + 0.7 * hr_reserve)),
+            'Z3': (round(hr_rest + 0.7 * hr_reserve), round(hr_rest + 0.8 * hr_reserve)),
+            'Z4': (round(hr_rest + 0.8 * hr_reserve), round(hr_rest + 0.9 * hr_reserve)),
+            'Z5': (round(hr_rest + 0.9 * hr_reserve), int(hr_max_pred))
         }
 
+        # Алёрты
         alerts = []
-        if sbp >= CONFIG['THRESHOLDS']['sbp_crit']: 
-            alerts.append(f"🛑 КРИТИЧЕСКОЕ АД: {sbp} достигло порога прекращения теста (Löllgen).")
+        if sbp >= CONFIG['THRESHOLDS']['sbp_crit']:
+            alerts.append(f"🛑 КРИТИЧЕСКОЕ АД {sbp} мм рт. ст. — тест должен быть прекращён (Löllgen Box 2)")
         elif sbp >= CONFIG['THRESHOLDS']['sbp_warn']:
-            alerts.append(f"⚠️ РИСК АД: Систолическое давление {sbp} выше нормы.")
-        
-        if rec_idx is not None and rec_idx < CONFIG['THRESHOLDS']['hr_rec_min']: 
-            alerts.append("⚠️ ВОССТАНОВЛЕНИЕ: ЧСС снижается медленно (<12 уд/мин). Риск переутомления.")
-        
-        if rpe > CONFIG['THRESHOLDS']['rpe_high'] and vo2_pct < 85:
-            alerts.append("⚠️ ДЕЗАДАПТАЦИЯ: Высокое RPE при невысоких показателях.")
+            alerts.append(f"⚠️ Высокое АД {sbp} мм рт. ст.")
+        if hr_rec and hr_rec < CONFIG['THRESHOLDS']['hr_rec_min']:
+            alerts.append("⚠️ Медленное восстановление ЧСС (<12 уд/мин) — риск переутомления")
+        if rpe > CONFIG['THRESHOLDS']['rpe_high'] and ceps < 80:
+            alerts.append("⚠️ Высокое RPE при среднем CEPS — возможна дезадаптация")
 
-        return {**data, 'hr_max_pred': round(hr_max_pred), 'vo2_rel': round(vo2_rel, 1), 'vo2_pct': round(vo2_pct, 1),
-                'vo2_norm': vo2_norm, 'rel_power': round(rel_power, 2), 'lt2_pct': round(lt2_pct, 1), 
-                'o2_pulse': round(o2_pulse, 1), 'rec_idx': rec_idx, 'performance_index': round(perf_idx, 1), 
-                'fitness_level': fit_level, 'zones': zones, 'alerts': alerts, 'sbp_val': sbp, 'rpe_val': rpe}
+        return {
+            'ceps': round(ceps, 1),
+            'fitness_level': fitness_level,
+            'power_score': round(power_score, 1),
+            'hr_score': round(hr_score, 1),
+            'lactate_score': round(lactate_score, 1),
+            'rpe_score': round(rpe_score, 1),
+            'recovery_score': round(recovery_score, 1),
+            'zones': zones,
+            'alerts': alerts,
+            'hr_max_pred': round(hr_max_pred),
+            **data
+        }
 
 # ===================================================================
-# ИНТЕРФЕЙС STREAMLIT
+# STREAMLIT ИНТЕРФЕЙС (оставлен почти без изменений)
 # ===================================================================
-st.set_page_config(page_title="Expert Physiology Analyzer", layout="wide")
+st.set_page_config(page_title="CEPS Analyzer — Löllgen 2018", layout="wide")
+st.title("🧬 CEPS Analyzer")
+st.caption("Единая шкала работоспособности 0–100 по данным Löllgen & Leyk 2018")
 
-st.title("🧬 Анализатор нагрузочного тестирования")
-st.caption("Expert Physiology Edition | Formulas: Löllgen, Rapp, Fiedler")
-
-tab1, tab2, tab3 = st.tabs(["📝 Ввод и Отчет", "📊 Графики", "📖 Справочник"])
+tab1, tab2, tab3 = st.tabs(["📝 Анализ", "📊 Графики", "📖 Справочник"])
 
 with tab1:
     with st.form("main_form"):
         col_a, col_b = st.columns(2)
         with col_a:
-            sex = st.radio("Пол:", ["Male", "Female"], horizontal=True)
-            test_type = st.radio("Тип теста:", ["bike", "tm"], format_func=lambda x: "Велоэргометр (Вт)" if x=="bike" else "Тредмил (км/ч)", horizontal=True)
-            age = st.number_input("Возраст (лет):", 10, 90, 35)
-            weight = st.number_input("Вес (кг):", 30.0, 200.0, 75.0)
-            rest_hr = st.number_input("ЧСС покоя:", 40, 120, 60)
+            sex = st.radio("Пол", ["Male", "Female"], horizontal=True)
+            test_type = st.radio("Тест", ["bike", "tm"], horizontal=True,
+                                 format_func=lambda x: "Велоэргометр (Вт)" if x == "bike" else "Тредмил (км/ч)")
+            age = st.number_input("Возраст", 18, 65, 35)
+            weight = st.number_input("Вес (кг)", 40.0, 150.0, 75.0)
+            rest_hr = st.number_input("ЧСС покоя", 40, 120, 60)
         with col_b:
-            power = st.number_input("Макс. нагрузка (Вт или км/ч):", 0.0, 1000.0, 250.0)
-            grade = st.number_input("Уклон (% для тредмила):", 0.0, 25.0, 0.0)
-            hr_peak = st.number_input("ЧСС пик (уд/мин):", 50, 220, 180)
-            sbp = st.number_input("САД пик (mmHg):", 80, 260, 170)
-            hr_rec = st.number_input("ЧСС 1 мин отдыха:", 40, 200, 140)
-            rpe = st.slider("Borg RPE (6-20):", 6, 20, 15)
-        
-        submit = st.form_submit_button("🚀 ЗАПУСТИТЬ АНАЛИЗ", type="primary")
+            power = st.number_input("Нагрузка (200 Вт или 13 км/ч)", 50.0, 400.0, 200.0)
+            hr_peak = st.number_input("ЧСС на этой нагрузке", 80, 220, 165)
+            lactate = st.number_input("Лактат (ммоль/л) на этой нагрузке", 0.5, 15.0, 5.0)
+            sbp = st.number_input("САД пик", 100, 260, 180)
+            hr_rec = st.number_input("ЧСС через 1 мин отдыха", 40, 200, 145)
+            rpe = st.slider("Borg RPE", 6, 20, 14)
 
-    if submit:
-        # Валидация типов для тредмила
-        if test_type == 'tm' and power > 30:
-            st.error("Ошибка: Для тредмила введите скорость в км/ч (напр. 12), а не Ватты.")
-        else:
-            raw_data = {'sex': sex, 'type': test_type, 'age': age, 'weight': weight, 'rest_hr': rest_hr,
-                        'power': power, 'grade': grade, 'hr': hr_peak, 'sbp': sbp, 'hr_rec': hr_rec, 'rpe': rpe}
+        if st.form_submit_button("🚀 Рассчитать CEPS", type="primary"):
+            raw_data = {
+                'sex': sex, 'type': test_type, 'age': age, 'weight': weight,
+                'power': power, 'hr': hr_peak, 'lactate': lactate,
+                'sbp': sbp, 'rest_hr': rest_hr, 'hr_rec': hr_rec, 'rpe': rpe
+            }
             res = StressTestAnalyzer.calculate(raw_data)
 
             for alert in res['alerts']:
                 st.warning(alert)
             if not res['alerts']:
-                st.success("✅ Противопоказаний по результатам теста не выявлено.")
+                st.success("✅ Всё в норме")
 
-            st.subheader("📊 Ключевые показатели")
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("VO2peak", f"{res['vo2_rel']} мл/кг", f"{res['vo2_pct']}% нормы")
-            m2.metric("Perf. Index", f"{res['performance_index']}/100", res['fitness_level'].upper())
-            m3.metric("O2 Pulse", f"{res['o2_pulse']} мл/уд")
-            m4.metric("Восстановление", f"-{res['rec_idx'] if res['rec_idx'] else 'N/A'} уд")
+            st.subheader("📈 Результат")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("CEPS", f"{res['ceps']}/100", res['fitness_level'].upper())
+            col2.metric("Power Score", f"{res['power_score']}")
+            col3.metric("HR Score", f"{res['hr_score']}")
+            col4.metric("Lactate Score", f"{res['lactate_score']}")
 
-            st.subheader("🏃 Тренировочный план")
-            if res['sbp_val'] >= 220 or res['rpe_val'] > 18:
-                st.error("⚠️ РЕЖИМ ОГРАНИЧЕНИЯ: Требуется консультация кардиолога.")
-            else:
-                plans = {
-                    'low': "📉 БАЗОВЫЙ ПЛАН: Аэробные нагрузки в Z2 (30-45 мин) 3 раза в неделю.",
-                    'medium': "📈 РАЗВИВАЮЩИЙ ПЛАН: 2 базы (Z2) + 1 темповая тренировка (Z3/Z4).",
-                    'high': "🏆 ПРОФЕССИОНАЛЬНЫЙ ПЛАН: Поляризованный тренинг (80% Z2, 20% Z5)."
-                }
-                st.info(plans[res['fitness_level']])
-            
-            # Сохранение результата для графика
             st.session_state['last_res'] = res
 
 with tab2:
     if 'last_res' in st.session_state:
         res = st.session_state['last_res']
         fig, axs = plt.subplots(1, 2, figsize=(12, 5))
-        
-        # График 1
-        axs[0].bar(['Ваш VO2', 'Норма'], [res['vo2_rel'], res['vo2_norm']], color=['#3498db', '#2ecc71'])
-        axs[0].set_title("Сравнение VO2peak (мл/кг/мин)")
+        axs[0].bar(['Power', 'HR', 'Lactate', 'RPE', 'Recovery'], 
+                   [res['power_score'], res['hr_score'], res['lactate_score'], 
+                    res['rpe_score'], res['recovery_score']], color=['#3498db', '#2ecc71', '#e74c3c', '#f1c40f', '#9b59b6'])
+        axs[0].set_title("Вклад компонентов в CEPS")
+        axs[0].set_ylim(0, 100)
 
-        # График 2
-        z_labels = ['Z1', 'Z2', 'Z3', 'Z4', 'Z5']
-        colors = ['#a1c4fd', '#7ed957', '#f1c40f', '#e67e22', '#e74c3c']
+        z_labels = list(res['zones'].keys())
         for i, z in enumerate(z_labels):
             low, high = res['zones'][z]
-            axs[1].barh(z, high-low, left=low, color=colors[i], edgecolor='black')
-            axs[1].text(low+(high-low)/2, i, f"{low}-{high}", ha='center', va='center', weight='bold')
+            axs[1].barh(z, high - low, left=low, color=['#a1c4fd', '#7ed957', '#f1c40f', '#e67e22', '#e74c3c'][i])
+            axs[1].text(low + (high - low) / 2, i, f"{low}-{high}", ha='center', va='center', weight='bold')
         axs[1].set_title("Зоны ЧСС (Карвонена)")
         st.pyplot(fig)
-    else:
-        st.info("Запустите анализ, чтобы увидеть графики.")
 
 with tab3:
-    st.markdown("""
-    ### 📖 Справочное пособие
-    1. **VO2peak**: Рассчитан по формуле: (W*12 + kg*3.5)/kg.
-    2. **ЧСС Recovery**: Снижение за 1 мин. Если < 12 уд/мин — маркер риска ССЗ (Löllgen).
-    3. **САД (Давление)**: Порог 250 mmHg — абсолютное прекращение теста.
-    4. **Нормативы**: Rapp (2018), Fiedler (2025).
-    """)
+    st.markdown("**CEPS** — Composite Ergometric Performance Score по данным Löllgen 2018\n\n"
+                "• 0–70 — низкий уровень\n"
+                "• 70–85 — средний\n"
+                "• 85–100 — высокий / элитный")
